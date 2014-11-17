@@ -49,8 +49,9 @@ int main()
         kyls_thread_create(thread_proc, (void*)i);
     }
     kyls_thread_sched();
+    printf("All thread termintated\n");
+    kyls_thread_destroy();
     return 0;
 }
-
 
 

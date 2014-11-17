@@ -23,6 +23,8 @@ typedef struct kyls_thread_t {
 kyls_thread_t *kyls_running_head, *kyls_running_tail;
 kyls_thread_t *kyls_sleeping_head;
 kyls_thread_t *kyls_current;
+kyls_thread_t *kyls_freelist;
+
 static mctx_t sched_ctx;
 
 static mctx_t *mctx_creat;
@@ -53,6 +55,8 @@ void kyls_t_add_running(kyls_thread_t *t);
 void kyls_t_remove_running(kyls_thread_t *t);
 void kyls_t_yield_no_shed();
 void kyls_t_switch_to(kyls_thread_t *t);
+void kyls_t_free(kyls_thread_t *t);
+void kyls_t_sched_no_sched();
 
 
 void mctx_create(mctx_t *mctx, void (*sf_addr)(void *), void *sf_arg, void *sk_addr, size_t sk_size)
@@ -139,9 +143,19 @@ void mctx_create_boot(void)
     mctx_start_func(mctx_start_arg);
 
     /* impossible to reach */
-    abort();
+    kyls_t_free(kyls_current);
+    kyls_t_sched_no_sched();
 }
 
+
+void kyls_t_free(kyls_thread_t *t)
+{
+    // do not free now since it is still running on the stack
+    // just put the thread context into free list
+    t->next = kyls_freelist;
+    t->prev = NULL;
+    kyls_freelist = t;
+}
 
 void kyls_switch_to(kyls_thread_t *t)
 {
@@ -158,7 +172,7 @@ void kyls_thread_yield()
     mctx_switch(&kyls_current->ctx, &sched_ctx);
 }
 
-void kyls_yield_no_shed()
+void kyls_t_sched_no_sched()
 {
     // save context switch to scheduler
     mctx_switch(&kyls_current->ctx, &sched_ctx);
@@ -206,17 +220,38 @@ void kyls_t_remove_running(kyls_thread_t *t)
 
 kyls_thread_t *kyls_thread_create(void (*sf_addr)(void *), void *sf_arg) 
 {
-    kyls_thread_t *t = (kyls_thread_t *)malloc(sizeof(*t));
-    t->sk_size = KYLS_SK_SIZE;
-    t->sk_addr = malloc(t->sk_size);
-    t->next = t->prev = NULL;
+    kyls_thread_t *t;
+
+    // fetch from free list if possible
+    if (kyls_freelist) {
+        t = kyls_freelist;
+        t->next = t->prev = NULL;
+        kyls_freelist = kyls_freelist->next;
+    } else {
+        t = (kyls_thread_t *)malloc(sizeof(*t));
+        t->sk_size = KYLS_SK_SIZE;
+        t->sk_addr = malloc(t->sk_size);
+        t->next = t->prev = NULL;
+    }
+
     mctx_create(&t->ctx, sf_addr, sf_arg, t->sk_addr, t->sk_size);
     kyls_t_add_running(t);
     return t;
 }
 
-void kyls_thread_exit()
+void kyls_thread_destroy()
 {
+    while(kyls_freelist) {
+        kyls_thread_t *t = kyls_freelist->next;
+        free(kyls_freelist->sk_addr);
+        free(kyls_freelist);
+        kyls_freelist = t;
+    }
+
+    kyls_running_head = kyls_running_tail = NULL;
+    kyls_sleeping_head = NULL;
+    kyls_current = NULL;
+    kyls_freelist = NULL;
 }
 
 void kyls_thread_init()
@@ -224,6 +259,7 @@ void kyls_thread_init()
     kyls_running_head = kyls_running_tail = NULL;
     kyls_sleeping_head = NULL;
     kyls_current = NULL;
+    kyls_freelist = NULL;
 }
 
 
