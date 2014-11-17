@@ -5,6 +5,8 @@
 #include <signal.h>
 #include <unistd.h>
 #include <stdbool.h>
+#include <time.h>
+#include <sys/epoll.h>
 
 #define KYLS_SK_SIZE (1024 * 1024)
 
@@ -13,19 +15,27 @@ typedef struct {
 } mctx_t;
 
 typedef struct kyls_thread_t {
+    int tid;
     mctx_t ctx;
+    time_t time_wakeup;
     void *sk_addr;
     size_t sk_size;
     struct kyls_thread_t *prev;
     struct kyls_thread_t *next;
 } kyls_thread_t;
 
-kyls_thread_t *kyls_running_head, *kyls_running_tail;
-kyls_thread_t *kyls_sleeping_head;
-kyls_thread_t *kyls_current;
-kyls_thread_t *kyls_freelist;
+static kyls_thread_t *kyls_running_head, *kyls_running_tail;
+static kyls_thread_t *kyls_sleeping_head;
+static kyls_thread_t *kyls_current;
+static kyls_thread_t *kyls_freelist;
 
 static mctx_t sched_ctx;
+
+static struct {
+    int epollfd;
+} kyls_ev;
+
+static int global_tid_idx = 0;
 
 static mctx_t *mctx_creat;
 static mctx_t mctx_caller;
@@ -141,8 +151,7 @@ void mctx_create_boot(void)
 
     /* thread starts */
     mctx_start_func(mctx_start_arg);
-
-    /* impossible to reach */
+/* impossible to reach */
     kyls_t_free(kyls_current);
     kyls_t_sched_no_sched();
 }
@@ -180,10 +189,29 @@ void kyls_t_sched_no_sched()
 
 void kyls_thread_sched()
 {
+    static const int MAX_EVENTS = 10;
+    kyls_current = NULL;
     while(kyls_running_head) {
-        kyls_thread_t *cur =  kyls_running_head;
-        kyls_t_remove_running(cur);
-        kyls_switch_to(cur);
+        struct epoll_event events[MAX_EVENTS];
+        int nfds = epoll_wait(kyls_ev.epollfd, events, MAX_EVENTS, 5);
+
+        time_t now = time(NULL);
+        kyls_thread_t *cur;
+        for(cur = kyls_running_head ; cur != NULL; ) {
+            // pick up threads need to be scheduled that has no timer or timer expired
+            if (cur->time_wakeup == 0 || cur->time_wakeup <= now) { 
+                kyls_thread_t *t = cur;
+                cur = cur->next;
+                t->time_wakeup = 0;
+                kyls_t_remove_running(t);
+                kyls_switch_to(t);
+
+                // may be not necessary
+                kyls_current = NULL;
+            } else {
+                cur = cur->next;
+            }
+        }
     }
 }
 
@@ -222,25 +250,36 @@ kyls_thread_t *kyls_thread_create(void (*sf_addr)(void *), void *sf_arg)
 {
     kyls_thread_t *t;
 
+    // currently the stack size is fixed
     // fetch from free list if possible
     if (kyls_freelist) {
         t = kyls_freelist;
         t->next = t->prev = NULL;
         kyls_freelist = kyls_freelist->next;
     } else {
+        // no freed, create a new one.
         t = (kyls_thread_t *)malloc(sizeof(*t));
         t->sk_size = KYLS_SK_SIZE;
         t->sk_addr = malloc(t->sk_size);
         t->next = t->prev = NULL;
+
+        // tid will also be reused, like file descriptor
+        t->tid = global_tid_idx++;
     }
 
+    t->time_wakeup = 0;
+
+    // create running context for this thread
     mctx_create(&t->ctx, sf_addr, sf_arg, t->sk_addr, t->sk_size);
+
+    // make it will be scheduled
     kyls_t_add_running(t);
     return t;
 }
 
 void kyls_thread_destroy()
 {
+    // deallocate everyone in free list
     while(kyls_freelist) {
         kyls_thread_t *t = kyls_freelist->next;
         free(kyls_freelist->sk_addr);
@@ -254,12 +293,35 @@ void kyls_thread_destroy()
     kyls_freelist = NULL;
 }
 
-void kyls_thread_init()
+int kyls_thread_init()
 {
     kyls_running_head = kyls_running_tail = NULL;
     kyls_sleeping_head = NULL;
     kyls_current = NULL;
     kyls_freelist = NULL;
+
+    kyls_ev.epollfd = epoll_create(1);
+    if (kyls_ev.epollfd < 0)
+        return -1;
+    return 0;
 }
 
+int kyls_thread_self()
+{
+    if (kyls_current)
+        return kyls_current->tid;
+    else
+        return -1;
+}
+
+void kyls_sleep(unsigned int seconds)
+{
+    if (!kyls_current)
+        return;
+
+    time_t c = time(NULL);
+    if (seconds)
+        kyls_current->time_wakeup = c + seconds;
+    kyls_thread_yield();
+}
 
