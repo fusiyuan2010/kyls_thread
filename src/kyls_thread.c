@@ -1,12 +1,12 @@
-#include <kyls_thread.h>
+#include <kyls_thread.h> 
 #include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
 #include <stdbool.h>
-#include <time.h>
 #include <sys/epoll.h>
+#include <sys/time.h>
 
 #define KYLS_SK_SIZE (1024 * 1024)
 
@@ -17,7 +17,8 @@ typedef struct {
 typedef struct kyls_thread_t {
     int tid;
     mctx_t ctx;
-    time_t time_wakeup;
+    struct timeval time_wakeup;
+
     void *sk_addr;
     size_t sk_size;
     struct kyls_thread_t *prev;
@@ -57,6 +58,7 @@ static sigset_t mctx_creat_sigs;
         longjmp((mctx_new)->jb, 1)
 
 
+int time_diff_ms(struct timeval *base);
 void mctx_create(mctx_t *mctx, void (*sf_addr)(void *), void *sf_arg, void *sk_addr, size_t sk_size);
 void mctx_create_trampoline(int sig);
 void mctx_create_boot(void);
@@ -68,6 +70,14 @@ void kyls_t_switch_to(kyls_thread_t *t);
 void kyls_t_free(kyls_thread_t *t);
 void kyls_t_sched_no_sched();
 
+
+int time_diff_ms(struct timeval *base)
+{
+    struct timeval tvnow;
+    gettimeofday(&tvnow, NULL);
+    long diff = (tvnow.tv_sec - base->tv_sec) * 1000000 + tvnow.tv_usec - base->tv_usec;
+    return diff / 1000;
+}
 
 void mctx_create(mctx_t *mctx, void (*sf_addr)(void *), void *sf_arg, void *sk_addr, size_t sk_size)
 {
@@ -195,14 +205,13 @@ void kyls_thread_sched()
         struct epoll_event events[MAX_EVENTS];
         int nfds = epoll_wait(kyls_ev.epollfd, events, MAX_EVENTS, 5);
 
-        time_t now = time(NULL);
         kyls_thread_t *cur;
         for(cur = kyls_running_head ; cur != NULL; ) {
             // pick up threads need to be scheduled that has no timer or timer expired
-            if (cur->time_wakeup == 0 || cur->time_wakeup <= now) { 
+            if (cur->time_wakeup.tv_sec == 0 || time_diff_ms(&cur->time_wakeup) > 0) { 
                 kyls_thread_t *t = cur;
                 cur = cur->next;
-                t->time_wakeup = 0;
+                t->time_wakeup.tv_sec = 0;
                 kyls_t_remove_running(t);
                 kyls_switch_to(t);
 
@@ -267,7 +276,8 @@ kyls_thread_t *kyls_thread_create(void (*sf_addr)(void *), void *sf_arg)
         t->tid = global_tid_idx++;
     }
 
-    t->time_wakeup = 0;
+    t->time_wakeup.tv_sec = 0;
+    t->time_wakeup.tv_usec = 0;
 
     // create running context for this thread
     mctx_create(&t->ctx, sf_addr, sf_arg, t->sk_addr, t->sk_size);
@@ -314,14 +324,19 @@ int kyls_thread_self()
         return -1;
 }
 
-void kyls_sleep(unsigned int seconds)
+void kyls_sleep_ms(unsigned int milliseconds)
 {
     if (!kyls_current)
         return;
 
-    time_t c = time(NULL);
-    if (seconds)
-        kyls_current->time_wakeup = c + seconds;
+    if (milliseconds) {
+        gettimeofday(&kyls_current->time_wakeup, NULL);
+        kyls_current->time_wakeup.tv_usec += (milliseconds % 1000) * 1000;
+        kyls_current->time_wakeup.tv_sec +=
+            (milliseconds / 1000) + kyls_current->time_wakeup.tv_usec / 1000000;
+        kyls_current->time_wakeup.tv_usec %= 1000000;
+    }
+
     kyls_thread_yield();
 }
 

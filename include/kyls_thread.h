@@ -12,7 +12,7 @@ void kyls_thread_destroy();
 int kyls_thread_self();
 
 
-void kyls_sleep(unsigned int seconds);
+void kyls_sleep_ms(unsigned int seconds);
 ssize_t kyls_read(int fd, void *buf, size_t n, int timeout_ms);
 ssize_t kyls_write(int fd, void *buf, size_t n, int timeout_ms);
 

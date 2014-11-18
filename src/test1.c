@@ -49,10 +49,11 @@ void thread_proc(void *arg)
     printf("Thread %ld began..\n", kyls_thread_self());
     for(i = 0; i < 7; i++) {
         int sec = rand() % 4;
-        kyls_sleep(sec);
+        kyls_sleep_ms(sec * 1000);
         printf("[%.3f] Thread %d printing %d, and slept %d seconds\n", 
                 time_diff_s(&tvbase), kyls_thread_self(), i, sec);
     }
+    printf("Thread %ld finished ...\n", kyls_thread_self());
 }
 
 int main()
