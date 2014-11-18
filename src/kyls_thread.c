@@ -2,9 +2,12 @@
 #include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <signal.h>
 #include <unistd.h>
-#include <stdbool.h>
+#include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/time.h>
 
@@ -16,6 +19,8 @@ typedef struct {
 
 typedef struct kyls_thread_t {
     int tid;
+    int blk_fd;
+    bool running;
     mctx_t ctx;
     struct timeval time_wakeup;
 
@@ -65,10 +70,11 @@ void mctx_create_boot(void);
 
 void kyls_t_add_running(kyls_thread_t *t);
 void kyls_t_remove_running(kyls_thread_t *t);
-void kyls_t_yield_no_shed();
 void kyls_t_switch_to(kyls_thread_t *t);
 void kyls_t_free(kyls_thread_t *t);
 void kyls_t_sched_no_sched();
+int kyls_ev_add_fd(int fd, uint32_t events);
+int kyls_ev_del_fd(int fd);
 
 
 int time_diff_ms(struct timeval *base)
@@ -201,9 +207,19 @@ void kyls_thread_sched()
 {
     static const int MAX_EVENTS = 10;
     kyls_current = NULL;
-    while(kyls_running_head) {
+    //while(kyls_running_head) {
+    while(1) {
         struct epoll_event events[MAX_EVENTS];
         int nfds = epoll_wait(kyls_ev.epollfd, events, MAX_EVENTS, 5);
+        int i;
+        // put triggered event's associated thread into running pool to be scheduled
+        for (i = 0; i < nfds; i++) {
+            kyls_thread_t *t = (kyls_thread_t *)(events[i].data.ptr);
+            if (!t->running) {
+                t->time_wakeup.tv_sec = 0;
+                kyls_t_add_running(t);
+            }
+        }
 
         kyls_thread_t *cur;
         for(cur = kyls_running_head ; cur != NULL; ) {
@@ -244,6 +260,7 @@ void kyls_t_add_running(kyls_thread_t *t)
         kyls_running_tail->next = t;
 
     kyls_running_tail = t;
+    t->running = true;
 }
 
 void kyls_t_remove_running(kyls_thread_t *t)
@@ -253,6 +270,7 @@ void kyls_t_remove_running(kyls_thread_t *t)
     if (kyls_running_tail == t) kyls_running_tail = t->prev;
     if (t->next) t->next->prev = t->prev;
     if (t->prev) t->prev->next = t->next;
+    t->running = false;
 }
 
 kyls_thread_t *kyls_thread_create(void (*sf_addr)(void *), void *sf_arg) 
@@ -278,6 +296,8 @@ kyls_thread_t *kyls_thread_create(void (*sf_addr)(void *), void *sf_arg)
 
     t->time_wakeup.tv_sec = 0;
     t->time_wakeup.tv_usec = 0;
+    t->blk_fd = -1;
+    t->running = false;
 
     // create running context for this thread
     mctx_create(&t->ctx, sf_addr, sf_arg, t->sk_addr, t->sk_size);
@@ -324,6 +344,28 @@ int kyls_thread_self()
         return -1;
 }
 
+int kyls_ev_add_fd(int fd, uint32_t events)
+{
+    struct epoll_event event;
+    event.events = events;
+    event.data.ptr = (void *)kyls_current;
+    return epoll_ctl(kyls_ev.epollfd, EPOLL_CTL_ADD, fd, &event);
+}
+
+int kyls_ev_del_fd(int fd)
+{
+    return epoll_ctl(kyls_ev.epollfd, EPOLL_CTL_ADD, fd, NULL);
+}
+
+int kyls_socket(int domain, int type, int protocol)
+{
+    int ret = socket(domain, type, protocol);
+    if (ret < 0)
+        return ret;
+    fcntl(ret, F_SETFL, fcntl(ret, F_GETFL, 0) | O_NONBLOCK );
+    return ret;
+}
+
 void kyls_sleep_ms(unsigned int milliseconds)
 {
     if (!kyls_current)
@@ -339,4 +381,82 @@ void kyls_sleep_ms(unsigned int milliseconds)
 
     kyls_thread_yield();
 }
+
+int kyls_accept(int fd, struct sockaddr *address, socklen_t *address_len, int timeout_ms)
+{
+    for(;;) {
+        // the socket buffer may has waiting connections
+        int ret = accept(fd, address, address_len);
+        if (ret >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            // got a connection or a REAL error
+            return ret;
+
+        if (kyls_ev_add_fd(fd, EPOLLIN))
+            return -1;
+
+        kyls_current->blk_fd = fd;
+        if (timeout_ms)
+            kyls_sleep_ms(timeout_ms);
+        else
+            kyls_t_sched_no_sched();
+
+        kyls_current->time_wakeup.tv_sec = 0;
+        kyls_ev_del_fd(fd);
+    }
+
+    // impossible to reach
+}
+
+ssize_t kyls_read(int fd, void *buf, size_t n, int timeout_ms)
+{
+    for(;;) {
+        // the socket buffer may has waiting data to read
+        ssize_t ret = read(fd, buf, n);
+        if (ret >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            // got data or a REAL error
+            return ret;
+
+        if (kyls_ev_add_fd(fd, EPOLLIN))
+            return -1;
+
+        kyls_current->blk_fd = fd;
+        if (timeout_ms)
+            kyls_sleep_ms(timeout_ms);
+        else
+            kyls_t_sched_no_sched();
+
+        kyls_current->time_wakeup.tv_sec = 0;
+        kyls_ev_del_fd(fd);
+    }
+
+    // impossible to reach
+}
+
+ssize_t kyls_write(int fd, void *buf, size_t n, int timeout_ms)
+{
+    for(;;) {
+        // the socket buffer may has waiting data to read
+        ssize_t ret = write(fd, buf, n);
+        if (ret > 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            // got data or a REAL error
+            return ret;
+
+        if (kyls_ev_add_fd(fd, EPOLLOUT))
+            return -1;
+
+        kyls_current->blk_fd = fd;
+        if (timeout_ms)
+            kyls_sleep_ms(timeout_ms);
+        else
+            kyls_t_sched_no_sched();
+
+        kyls_current->time_wakeup.tv_sec = 0;
+        kyls_ev_del_fd(fd);
+    }
+
+    // impossible to reach
+
+    return 0;
+}
+
 

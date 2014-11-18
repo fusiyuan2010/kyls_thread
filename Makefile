@@ -15,14 +15,18 @@ LIBDIR := lib
 
 OBJS := $(addprefix $(SRCDIR)/, kyls_thread.o)
 OBJTEST1 := $(addprefix $(SRCDIR)/, test1.o)
+OBJECHO_SERVER := $(addprefix $(SRCDIR)/, echo_server.o)
 
 LIBOUTPUT = $(LIBDIR)/libkyls.a $(LIBDIR)/libkyls.so
 
-all: test1 $(LIBOUTPUT)
+all: test1 echo_server $(LIBOUTPUT)
 
 test1 : $(OBJTEST1) $(LIBOUTPUT)
 	$(CC) $(INCLUDE_PATH) -o $@ $^
 	
+echo_server: $(OBJECHO_SERVER) $(LIBOUTPUT)
+	$(CC) $(INCLUDE_PATH) -o $@ $^
+
 $(LIBDIR)/libkyls.a : $(OBJS)
 	mkdir -p $(LIBDIR) 
 	ar cqs $@ $^
