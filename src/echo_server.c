@@ -4,6 +4,8 @@
 #include <string.h>
 #include <strings.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 void conn_proc(void *arg)
 {
@@ -36,6 +38,8 @@ void server_proc(void *arg)
     servaddr.sin_addr.s_addr = htons(INADDR_ANY);
     servaddr.sin_port = htons(*(int*)arg);
  
+    int so_reuseaddr = 1;
+    setsockopt(listen_fd,SOL_SOCKET,SO_REUSEADDR, &so_reuseaddr,sizeof so_reuseaddr);
     kyls_bind(listen_fd, (struct sockaddr *) &servaddr, sizeof(servaddr));
  
     kyls_listen(listen_fd, 10);

@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/time.h>
+#include <assert.h>
 
 #define KYLS_SK_SIZE (1024 * 1024)
 
@@ -17,14 +18,21 @@ typedef struct {
     jmp_buf jb;
 } mctx_t;
 
+#define SR_TIMEUP  0x1
+#define SR_IOEVENT  0x2
+#define SR_NORMAL  0x4
+
 typedef struct kyls_thread_t {
     int tid;
     int blk_fd;
     bool running;
     mctx_t ctx;
     struct timeval time_wakeup;
+    uint32_t sched_reason;
 
-    void *sk_addr;
+    void (*sk_addr)(void *);
+    void *proc_arg;
+    void *proc_addr;
     size_t sk_size;
     struct kyls_thread_t *prev;
     struct kyls_thread_t *next;
@@ -34,6 +42,9 @@ static kyls_thread_t *kyls_running_head, *kyls_running_tail;
 static kyls_thread_t *kyls_sleeping_head;
 static kyls_thread_t *kyls_current;
 static kyls_thread_t *kyls_freelist;
+static kyls_thread_t *kyls_pending_new;
+//static kyls_thread_t *kyls_pending_free;
+static int kyls_thread_num = 0;
 
 static mctx_t sched_ctx;
 
@@ -68,11 +79,11 @@ void mctx_create(mctx_t *mctx, void (*sf_addr)(void *), void *sf_arg, void *sk_a
 void mctx_create_trampoline(int sig);
 void mctx_create_boot(void);
 
-void kyls_t_add_running(kyls_thread_t *t);
+void kyls_t_add_running(kyls_thread_t *t, uint32_t reason);
 void kyls_t_remove_running(kyls_thread_t *t);
 void kyls_t_switch_to(kyls_thread_t *t);
 void kyls_t_free(kyls_thread_t *t);
-void kyls_t_sched_no_sched();
+void kyls_t_yield_no_sched();
 int kyls_ev_add_fd(int fd, uint32_t events);
 int kyls_ev_del_fd(int fd);
 
@@ -167,9 +178,11 @@ void mctx_create_boot(void)
 
     /* thread starts */
     mctx_start_func(mctx_start_arg);
-/* impossible to reach */
+    
+    /* thread returned */
+    kyls_thread_num--;
     kyls_t_free(kyls_current);
-    kyls_t_sched_no_sched();
+    kyls_t_yield_no_sched();
 }
 
 
@@ -191,15 +204,17 @@ void kyls_switch_to(kyls_thread_t *t)
 void kyls_thread_yield()
 {
     // add current task to the end of running queue
-    kyls_t_add_running(kyls_current);
+    kyls_current->sched_reason = 0;
+    kyls_t_add_running(kyls_current, SR_NORMAL);
 
     // save context switch to scheduler
     mctx_switch(&kyls_current->ctx, &sched_ctx);
 }
 
-void kyls_t_sched_no_sched()
+void kyls_t_yield_no_sched()
 {
     // save context switch to scheduler
+    kyls_current->sched_reason = 0;
     mctx_switch(&kyls_current->ctx, &sched_ctx);
 }
 
@@ -207,40 +222,64 @@ void kyls_thread_sched()
 {
     static const int MAX_EVENTS = 10;
     kyls_current = NULL;
-    //while(kyls_running_head) {
-    while(1) {
+
+    // keep run until no thread living and no pending new thread
+    while(kyls_pending_new || kyls_thread_num) {
         struct epoll_event events[MAX_EVENTS];
-        int nfds = epoll_wait(kyls_ev.epollfd, events, MAX_EVENTS, 5);
+        int nfds = epoll_wait(kyls_ev.epollfd, events, MAX_EVENTS, 5); 
         int i;
         // put triggered event's associated thread into running pool to be scheduled
         for (i = 0; i < nfds; i++) {
             kyls_thread_t *t = (kyls_thread_t *)(events[i].data.ptr);
-            if (!t->running) {
-                t->time_wakeup.tv_sec = 0;
-                kyls_t_add_running(t);
-            }
+            if (!t->running) 
+                kyls_t_add_running(t, SR_IOEVENT);
         }
 
         kyls_thread_t *cur;
-        for(cur = kyls_running_head ; cur != NULL; ) {
-            // pick up threads need to be scheduled that has no timer or timer expired
-            if (cur->time_wakeup.tv_sec == 0 || time_diff_ms(&cur->time_wakeup) > 0) { 
-                kyls_thread_t *t = cur;
-                cur = cur->next;
-                t->time_wakeup.tv_sec = 0;
-                kyls_t_remove_running(t);
-                kyls_switch_to(t);
 
-                // may be not necessary
-                kyls_current = NULL;
+        // check pending new threads, create context for them
+        for(cur = kyls_pending_new; cur != NULL; ) {
+            kyls_thread_t *t = cur;
+            cur = cur->next;
+            // create running context for this thread
+            mctx_create(&t->ctx, t->proc_addr, t->proc_arg, t->sk_addr, t->sk_size);
+            // make it will be scheduled
+            kyls_t_add_running(t, SR_NORMAL);
+        }
+        kyls_pending_new = NULL;
+
+        // check sleeping threads with timer set
+        // if it expired, remove it from linked list
+        kyls_thread_t dummy;
+        cur = &dummy;
+        cur->next = kyls_sleeping_head;
+        for(; cur->next; ) {
+            kyls_thread_t *t = cur->next;
+            assert(t->time_wakeup.tv_sec > 0);
+            if (time_diff_ms(&t->time_wakeup) >= 0) {
+                cur->next = t->next;
+                t->time_wakeup.tv_sec = 0;
+                kyls_t_add_running(t, SR_TIMEUP);
             } else {
                 cur = cur->next;
             }
         }
+        kyls_sleeping_head = dummy.next;
+
+        for(cur = kyls_running_head ; cur != NULL; ) {
+            // pick up threads need to be scheduled that has no timer or timer expired
+            kyls_thread_t *t = cur;
+            cur = cur->next;
+            kyls_t_remove_running(t);
+            kyls_switch_to(t);
+
+            // may be not necessary
+            kyls_current = NULL;
+        }
     }
 }
 
-void kyls_t_add_running(kyls_thread_t *t)
+void kyls_t_add_running(kyls_thread_t *t, uint32_t reason)
 {
     /* remove from sleeping list */
     /*
@@ -248,6 +287,9 @@ void kyls_t_add_running(kyls_thread_t *t)
     if (t->next) t->next->prev = t->prev;
     if (t->prev) t->prev->next = t->next;
     */
+    t->sched_reason |= reason;
+    if (t->running)
+        return;
 
     /* add to running list, the tail */
     t->next = NULL;
@@ -266,6 +308,7 @@ void kyls_t_add_running(kyls_thread_t *t)
 void kyls_t_remove_running(kyls_thread_t *t)
 {
     /* remove from running list */
+    assert(t->running == true);
     if (kyls_running_head == t) kyls_running_head = t->next;
     if (kyls_running_tail == t) kyls_running_tail = t->prev;
     if (t->next) t->next->prev = t->prev;
@@ -273,7 +316,7 @@ void kyls_t_remove_running(kyls_thread_t *t)
     t->running = false;
 }
 
-kyls_thread_t *kyls_thread_create(void (*sf_addr)(void *), void *sf_arg) 
+kyls_thread_t *kyls_thread_create(void (*proc_addr)(void *), void *proc_arg) 
 {
     kyls_thread_t *t;
 
@@ -298,12 +341,14 @@ kyls_thread_t *kyls_thread_create(void (*sf_addr)(void *), void *sf_arg)
     t->time_wakeup.tv_usec = 0;
     t->blk_fd = -1;
     t->running = false;
+    t->sched_reason = 0;
+    t->proc_addr = proc_addr;
+    t->proc_arg = proc_arg;
 
-    // create running context for this thread
-    mctx_create(&t->ctx, sf_addr, sf_arg, t->sk_addr, t->sk_size);
-
-    // make it will be scheduled
-    kyls_t_add_running(t);
+    // actual context thread creation is only done in schedular. 
+    t->next = kyls_pending_new;
+    kyls_pending_new = t;
+    kyls_thread_num++;
     return t;
 }
 
@@ -329,6 +374,9 @@ int kyls_thread_init()
     kyls_sleeping_head = NULL;
     kyls_current = NULL;
     kyls_freelist = NULL;
+    kyls_pending_new = NULL;
+    //kyls_pending_free = NULL;
+    kyls_thread_num = 0;
 
     kyls_ev.epollfd = epoll_create(1);
     if (kyls_ev.epollfd < 0)
@@ -377,9 +425,14 @@ void kyls_sleep_ms(unsigned int milliseconds)
         kyls_current->time_wakeup.tv_sec +=
             (milliseconds / 1000) + kyls_current->time_wakeup.tv_usec / 1000000;
         kyls_current->time_wakeup.tv_usec %= 1000000;
+        
+        kyls_current->next = kyls_sleeping_head;
+        kyls_sleeping_head = kyls_current;
+        kyls_t_yield_no_sched();
+    } else {
+        kyls_thread_yield();
     }
 
-    kyls_thread_yield();
 }
 
 int kyls_accept(int fd, struct sockaddr *address, socklen_t *address_len, int timeout_ms)
@@ -387,9 +440,15 @@ int kyls_accept(int fd, struct sockaddr *address, socklen_t *address_len, int ti
     for(;;) {
         // the socket buffer may has waiting connections
         int ret = accept(fd, address, address_len);
-        if (ret >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        if (ret >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)
+                || (kyls_current->sched_reason & SR_TIMEUP)) {
             // got a connection or a REAL error
+            kyls_ev_del_fd(fd);
+            if (ret > 0) {
+                fcntl(ret, F_SETFL, fcntl(ret, F_GETFL, 0) | O_NONBLOCK );
+            }
             return ret;
+        }
 
         if (kyls_ev_add_fd(fd, EPOLLIN))
             return -1;
@@ -398,12 +457,9 @@ int kyls_accept(int fd, struct sockaddr *address, socklen_t *address_len, int ti
         if (timeout_ms)
             kyls_sleep_ms(timeout_ms);
         else
-            kyls_t_sched_no_sched();
+            kyls_t_yield_no_sched();
 
-        kyls_current->time_wakeup.tv_sec = 0;
-        kyls_ev_del_fd(fd);
     }
-
     // impossible to reach
 }
 
@@ -412,9 +468,12 @@ ssize_t kyls_read(int fd, void *buf, size_t n, int timeout_ms)
     for(;;) {
         // the socket buffer may has waiting data to read
         ssize_t ret = read(fd, buf, n);
-        if (ret >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        if (ret >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)
+                || (kyls_current->sched_reason & SR_TIMEUP)) {
             // got data or a REAL error
+            kyls_ev_del_fd(fd);
             return ret;
+        }
 
         if (kyls_ev_add_fd(fd, EPOLLIN))
             return -1;
@@ -423,12 +482,8 @@ ssize_t kyls_read(int fd, void *buf, size_t n, int timeout_ms)
         if (timeout_ms)
             kyls_sleep_ms(timeout_ms);
         else
-            kyls_t_sched_no_sched();
-
-        kyls_current->time_wakeup.tv_sec = 0;
-        kyls_ev_del_fd(fd);
+            kyls_t_yield_no_sched();
     }
-
     // impossible to reach
 }
 
@@ -437,9 +492,12 @@ ssize_t kyls_write(int fd, void *buf, size_t n, int timeout_ms)
     for(;;) {
         // the socket buffer may has waiting data to read
         ssize_t ret = write(fd, buf, n);
-        if (ret > 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        if (ret > 0 || (errno != EAGAIN && errno != EWOULDBLOCK)
+                || (kyls_current->sched_reason & SR_TIMEUP)) {
             // got data or a REAL error
+            kyls_ev_del_fd(fd);
             return ret;
+        }
 
         if (kyls_ev_add_fd(fd, EPOLLOUT))
             return -1;
@@ -448,15 +506,9 @@ ssize_t kyls_write(int fd, void *buf, size_t n, int timeout_ms)
         if (timeout_ms)
             kyls_sleep_ms(timeout_ms);
         else
-            kyls_t_sched_no_sched();
-
-        kyls_current->time_wakeup.tv_sec = 0;
-        kyls_ev_del_fd(fd);
+            kyls_t_yield_no_sched();
     }
-
     // impossible to reach
-
-    return 0;
 }
 
 
