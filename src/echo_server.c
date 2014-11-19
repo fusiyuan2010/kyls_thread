@@ -13,9 +13,9 @@ void conn_proc(void *arg)
     int fd = *(int *)arg;
     while(1)
     {
-        int k = kyls_read(fd ,str,100, 0);
+        int k = kyls_read(fd ,str, 100, 0);
         if (k < 0)
-            break;
+            continue;
 
         str[k] = '\0';
         kyls_sleep_ms(1000);
@@ -48,7 +48,7 @@ void server_proc(void *arg)
     while(1) {
         int comm_fd = kyls_accept(listen_fd, (struct sockaddr*) NULL, NULL, 0);
         if (comm_fd < 0)
-            break;
+            continue;
 
         int *fd = (int *)malloc(sizeof(*fd));
         *fd = comm_fd;

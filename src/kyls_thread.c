@@ -231,8 +231,8 @@ void kyls_thread_sched()
         // put triggered event's associated thread into running pool to be scheduled
         for (i = 0; i < nfds; i++) {
             kyls_thread_t *t = (kyls_thread_t *)(events[i].data.ptr);
-            if (!t->running) 
-                kyls_t_add_running(t, SR_IOEVENT);
+            printf("thread %d fd[%d] event:%u\n", t->tid, t->blk_fd, events[i].events);
+            kyls_t_add_running(t, SR_IOEVENT);
         }
 
         kyls_thread_t *cur;
@@ -253,7 +253,7 @@ void kyls_thread_sched()
         kyls_thread_t dummy;
         cur = &dummy;
         cur->next = kyls_sleeping_head;
-        for(; cur->next; ) {
+        for(; cur->next;  ) {
             kyls_thread_t *t = cur->next;
             assert(t->time_wakeup.tv_sec > 0);
             if (time_diff_ms(&t->time_wakeup) >= 0) {
@@ -402,7 +402,7 @@ int kyls_ev_add_fd(int fd, uint32_t events)
 
 int kyls_ev_del_fd(int fd)
 {
-    return epoll_ctl(kyls_ev.epollfd, EPOLL_CTL_ADD, fd, NULL);
+    return epoll_ctl(kyls_ev.epollfd, EPOLL_CTL_DEL, fd, NULL);
 }
 
 int kyls_socket(int domain, int type, int protocol)
@@ -444,9 +444,13 @@ int kyls_accept(int fd, struct sockaddr *address, socklen_t *address_len, int ti
                 || (kyls_current->sched_reason & SR_TIMEUP)) {
             // got a connection or a REAL error
             kyls_ev_del_fd(fd);
-            if (ret > 0) {
+            if (ret >= 0) {
                 fcntl(ret, F_SETFL, fcntl(ret, F_GETFL, 0) | O_NONBLOCK );
+                printf("accept new fd %d \n", ret);
+            } else {
+                printf("accept -1 %s\n", strerror(errno));
             }
+            kyls_current->sched_reason = 0;
             return ret;
         }
 
@@ -458,7 +462,6 @@ int kyls_accept(int fd, struct sockaddr *address, socklen_t *address_len, int ti
             kyls_sleep_ms(timeout_ms);
         else
             kyls_t_yield_no_sched();
-
     }
     // impossible to reach
 }
@@ -472,6 +475,11 @@ ssize_t kyls_read(int fd, void *buf, size_t n, int timeout_ms)
                 || (kyls_current->sched_reason & SR_TIMEUP)) {
             // got data or a REAL error
             kyls_ev_del_fd(fd);
+            if (ret >= 0)
+                printf("read %d\n", ret);
+            else
+                printf("read -1 %s\n", strerror(errno));
+            kyls_current->sched_reason = 0;
             return ret;
         }
 
@@ -496,6 +504,11 @@ ssize_t kyls_write(int fd, void *buf, size_t n, int timeout_ms)
                 || (kyls_current->sched_reason & SR_TIMEUP)) {
             // got data or a REAL error
             kyls_ev_del_fd(fd);
+            if (ret >= 0)
+                printf("write %d\n", ret);
+            else
+                printf("write -1 %s\n", strerror(errno));
+            kyls_current->sched_reason = 0;
             return ret;
         }
 
