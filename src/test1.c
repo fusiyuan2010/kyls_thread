@@ -4,33 +4,6 @@
 #include <time.h>
 #include <sys/time.h>
 
-
-/*
-ssize_t kyls_read(int fd, void *buf, size_t n)
-{
-    //reg event
-    //kyls_yield()
-    //read();
-    //
-    return 0;
-}
-
-ssize_t kyls_write(int fd, void *buf, size_t n)
-{
-    //write();
-    //kyls_yield
-    // wait until all write done
-    return 0;
-}
-
-int kyls_accept(int fd, struct sockaddr *restrict address, socklen_t *restrict address_len)
-{
-    //wait until event
-    //return accept(fd, address, address_len);
-    return 0;
-}
-
-*/
 double time_diff_s(struct timeval *base)
 {
     struct timeval tvnow;
@@ -59,7 +32,7 @@ void thread_proc(void *arg)
 int main()
 {
     int i;
-    srand(time(NULL));
+    //srand(time(NULL));
     gettimeofday(&tvbase, NULL);
 
 

@@ -5,8 +5,13 @@
 #include <sys/types.h>
 
 typedef struct kyls_thread_t kyls_thread_t;
+typedef kyls_thread_t* kyls_thread;
 
-kyls_thread_t *kyls_thread_create(void (*sf_addr)(void *), void *sf_arg);
+kyls_thread kyls_thread_create(void (*sf_addr)(void *), void *sf_arg);
+
+// not implemented yet
+int kyls_thread_kill(kyls_thread t);
+
 void kyls_thread_yield();
 int kyls_thread_init();
 void kyls_thread_sched();

@@ -2,26 +2,38 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <strings.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
+static kyls_thread server_thread;
+static int terminate = 0;
+
 void conn_proc(void *arg)
 {
     char str[100];
     int fd = *(int *)arg;
+
     while(1)
     {
         int k = kyls_read(fd ,str, 100, 0);
-        if (k < 0)
+
+        if (k == 0) {
+            close(k);
+            break;
+        } else if (k < 0)
             continue;
 
         str[k] = '\0';
+        if (strcmp(str, "bye\r\n") == 0)
+            terminate = 1;
+
         kyls_sleep_ms(1000);
-        printf("Echoing back - %s",str);
         kyls_write(fd, str, strlen(str)+1, 0);
     }
+    printf("client thread on fd %d exited\n", fd);
 }
 
 void server_proc(void *arg) 
@@ -45,8 +57,8 @@ void server_proc(void *arg)
     kyls_listen(listen_fd, 10);
     
  
-    while(1) {
-        int comm_fd = kyls_accept(listen_fd, (struct sockaddr*) NULL, NULL, 0);
+    while(!terminate) {
+        int comm_fd = kyls_accept(listen_fd, (struct sockaddr*) NULL, NULL, 1000);
         if (comm_fd < 0)
             continue;
 
@@ -54,13 +66,14 @@ void server_proc(void *arg)
         *fd = comm_fd;
         kyls_thread_create(conn_proc, (void *)fd);
     }
+    printf("server thread exited\n");
 }
 
 int main()
 {
     int port = 8964;
     kyls_thread_init();
-    kyls_thread_create(server_proc, &port);
+    server_thread = kyls_thread_create(server_proc, &port);
     kyls_thread_sched();
     printf("All thread termintated\n");
     kyls_thread_destroy();
